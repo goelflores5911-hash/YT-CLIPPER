@@ -1,0 +1,723 @@
+"""YouTube AI agent: Claude + YouTube skill.
+
+Setup:
+    pip install anthropic requests youtube-transcript-api
+    export ANTHROPIC_API_KEY="..."
+    export YOUTUBE_API_KEY="..."
+Run:
+    python youtube_agent.py
+"""
+import anthropic
+
+import youtube_skill as yt
+
+client = anthropic.Anthropic()
+MODEL = "claude-sonnet-5-5"
+
+
+def run_agent(user_input, history):
+    history.append({"role": "user", "content": user_input})
+    while True:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=2000,
+            system=yt.SKILL_PROMPT,
+            tools=yt.TOOLS,
+            messages=history,
+        )
+        history.append({"role": "assistant", "content": resp.content})
+
+        if resp.stop_reason != "tool_use":
+            return "".join(b.text for b in resp.content if b.type == "text")
+
+        results = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                try:
+                    out = yt.TOOL_FUNCS[block.name](**block.input)
+                except Exception as e:
+                    out = f"Tool error: {e}"
+                results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": out}
+                )
+        history.append({"role": "user", "content": results})
+
+
+if __name__ == "__main__":
+    history = []
+    print("YouTube Agent ready. Type 'exit' to quit.")
+    while True:
+        q = input("You: ")
+        if q.strip().lower() == "exit":
+            break
+        print("Agent:", run_agent(q, history))
+"""YouTube skill: tools an AI agent can use to work with YouTube.
+
+Needs:
+    pip install requests youtube-transcript-api
+    export YOUTUBE_API_KEY="your-youtube-data-api-v3-key"
+"""
+import json
+import os
+import re
+
+import requests
+
+YT_API = "https://www.googleapis.com/youtube/v3"
+YT_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+
+def extract_video_id(url_or_id: str) -> str:
+    """Accepts a full YouTube link (watch, youtu.be, shorts) or a bare ID."""
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})", url_or_id)
+    return m.group(1) if m else url_or_id.strip()
+
+
+def youtube_search(query: str, max_results: int = 5) -> str:
+    r = requests.get(
+        f"{YT_API}/search",
+        params={
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": max_results,
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = [
+        {
+            "video_id": i["id"]["videoId"],
+            "title": i["snippet"]["title"],
+            "channel": i["snippet"]["channelTitle"],
+            "published": i["snippet"]["publishedAt"][:10],
+            "url": f"https://youtu.be/{i['id']['videoId']}",
+        }
+        for i in r.json().get("items", [])
+    ]
+    return json.dumps(items, ensure_ascii=False)
+
+
+def youtube_video_details(video: str) -> str:
+    vid = extract_video_id(video)
+    r = requests.get(
+        f"{YT_API}/videos",
+        params={"part": "snippet,statistics,contentDetails", "id": vid, "key": YT_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    if not items:
+        return "Video not found."
+    v = items[0]
+    return json.dumps(
+        {
+            "title": v["snippet"]["title"],
+            "channel": v["snippet"]["channelTitle"],
+            "description": v["snippet"]["description"][:800],
+            "tags": v["snippet"].get("tags", [])[:15],
+            "duration": v["contentDetails"]["duration"],
+            "views": v["statistics"].get("viewCount"),
+            "likes": v["statistics"].get("likeCount"),
+            "comments": v["statistics"].get("commentCount"),
+        },
+        ensure_ascii=False,
+    )
+
+
+def youtube_transcript(video: str, max_chars: int = 12000) -> str:
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    vid = extract_video_id(video)
+    try:
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(vid, languages=["hi", "en"])
+        text = " ".join(s.text for s in fetched)
+    except Exception as e:  # no captions, private video, blocked, etc.
+        return f"Transcript not available: {e}"
+    return text[:max_chars]
+
+
+def youtube_comments(video: str, max_results: int = 20, order: str = "relevance") -> str:
+    """Top comments of a video. order: 'relevance' or 'time'."""
+    vid = extract_video_id(video)
+    r = requests.get(
+        f"{YT_API}/commentThreads",
+        params={
+            "part": "snippet",
+            "videoId": vid,
+            "maxResults": min(max_results, 50),
+            "order": order,
+            "textFormat": "plainText",
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    if r.status_code == 403:
+        return "Comments are disabled for this video (or quota exceeded)."
+    r.raise_for_status()
+    out = []
+    for i in r.json().get("items", []):
+        c = i["snippet"]["topLevelComment"]["snippet"]
+        out.append(
+            {
+                "author": c["authorDisplayName"],
+                "text": c["textDisplay"][:300],
+                "likes": c["likeCount"],
+                "replies": i["snippet"]["totalReplyCount"],
+            }
+        )
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _resolve_channel_id(channel: str) -> str:
+    """Accepts channel ID, @handle, or channel URL."""
+    channel = channel.strip()
+    m = re.search(r"(UC[A-Za-z0-9_-]{22})", channel)
+    if m:
+        return m.group(1)
+    handle = re.search(r"@([A-Za-z0-9._-]+)", channel)
+    if handle:
+        r = requests.get(
+            f"{YT_API}/channels",
+            params={"part": "id", "forHandle": "@" + handle.group(1), "key": YT_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if items:
+            return items[0]["id"]
+    # fallback: search by name
+    r = requests.get(
+        f"{YT_API}/search",
+        params={"part": "snippet", "q": channel, "type": "channel", "maxResults": 1, "key": YT_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    if not items:
+        raise ValueError("Channel not found")
+    return items[0]["snippet"]["channelId"]
+
+
+def youtube_channel_analysis(channel: str, recent_videos: int = 10) -> str:
+    """Channel stats + performance of its latest videos."""
+    cid = _resolve_channel_id(channel)
+    r = requests.get(
+        f"{YT_API}/channels",
+        params={"part": "snippet,statistics,contentDetails", "id": cid, "key": YT_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    ch = r.json()["items"][0]
+    uploads = ch["contentDetails"]["relatedPlaylists"]["uploads"]
+
+    p = requests.get(
+        f"{YT_API}/playlistItems",
+        params={
+            "part": "contentDetails",
+            "playlistId": uploads,
+            "maxResults": min(recent_videos, 25),
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    p.raise_for_status()
+    ids = [i["contentDetails"]["videoId"] for i in p.json().get("items", [])]
+
+    videos = []
+    if ids:
+        v = requests.get(
+            f"{YT_API}/videos",
+            params={"part": "snippet,statistics", "id": ",".join(ids), "key": YT_KEY},
+            timeout=15,
+        )
+        v.raise_for_status()
+        for i in v.json().get("items", []):
+            videos.append(
+                {
+                    "title": i["snippet"]["title"],
+                    "published": i["snippet"]["publishedAt"][:10],
+                    "views": int(i["statistics"].get("viewCount", 0)),
+                    "likes": int(i["statistics"].get("likeCount", 0)),
+                    "comments": int(i["statistics"].get("commentCount", 0)),
+                    "url": f"https://youtu.be/{i['id']}",
+                }
+            )
+    s = ch["statistics"]
+    return json.dumps(
+        {
+            "channel": ch["snippet"]["title"],
+            "subscribers": s.get("subscriberCount"),
+            "total_views": s.get("viewCount"),
+            "video_count": s.get("videoCount"),
+            "recent_videos": videos,
+        },
+        ensure_ascii=False,
+    )
+
+
+def youtube_topic_research(topic: str, max_results: int = 8) -> str:
+    """Top videos on a topic with views and tags, for title/tag/idea research."""
+    s = requests.get(
+        f"{YT_API}/search",
+        params={
+            "part": "snippet",
+            "q": topic,
+            "type": "video",
+            "order": "viewCount",
+            "maxResults": min(max_results, 15),
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    s.raise_for_status()
+    ids = [i["id"]["videoId"] for i in s.json().get("items", [])]
+    if not ids:
+        return "No videos found."
+    v = requests.get(
+        f"{YT_API}/videos",
+        params={"part": "snippet,statistics", "id": ",".join(ids), "key": YT_KEY},
+        timeout=15,
+    )
+    v.raise_for_status()
+    out = [
+        {
+            "title": i["snippet"]["title"],
+            "channel": i["snippet"]["channelTitle"],
+            "views": i["statistics"].get("viewCount"),
+            "tags": i["snippet"].get("tags", [])[:12],
+            "url": f"https://youtu.be/{i['id']}",
+        }
+        for i in v.json().get("items", [])
+    ]
+    return json.dumps(out, ensure_ascii=False)
+
+
+# name -> function
+TOOL_FUNCS = {
+    "youtube_search": youtube_search,
+    "youtube_video_details": youtube_video_details,
+    "youtube_transcript": youtube_transcript,
+    "youtube_comments": youtube_comments,
+    "youtube_channel_analysis": youtube_channel_analysis,
+    "youtube_topic_research": youtube_topic_research,
+}
+
+# schemas sent to Claude
+TOOLS = [
+    {
+        "name": "youtube_search",
+        "description": "Search YouTube for videos. Returns title, channel, date, link.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "description": "1-10"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "youtube_video_details",
+        "description": "Get stats (views, likes, comments), tags, description of a video from its link or ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"video": {"type": "string", "description": "URL or video ID"}},
+            "required": ["video"],
+        },
+    },
+    {
+        "name": "youtube_transcript",
+        "description": "Get the spoken transcript/captions of a video, to summarize or analyze it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"video": {"type": "string", "description": "URL or video ID"}},
+            "required": ["video"],
+        },
+    },
+    {
+        "name": "youtube_comments",
+        "description": "Read top comments of a video, to understand audience feedback, sentiment and questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "video": {"type": "string", "description": "URL or video ID"},
+                "max_results": {"type": "integer", "description": "1-50"},
+                "order": {"type": "string", "enum": ["relevance", "time"]},
+            },
+            "required": ["video"],
+        },
+    },
+    {
+        "name": "youtube_channel_analysis",
+        "description": "Analyze a channel: subscribers, total views, and performance of its latest videos.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "@handle, channel URL, channel ID or name"},
+                "recent_videos": {"type": "integer", "description": "1-25"},
+            },
+            "required": ["channel"],
+        },
+    },
+    {
+        "name": "youtube_topic_research",
+        "description": "Find the most-viewed videos on a topic with their titles and tags, for title, tag and content idea research.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "max_results": {"type": "integer", "description": "1-15"},
+            },
+            "required": ["topic"],
+        },
+    },
+]
+
+SKILL_PROMPT = (
+    "You have a YouTube skill. Tools: search videos, video details, transcripts, "
+    "comments, channel analysis and topic research. "
+    "For summaries, read the transcript first. For audience feedback, read comments "
+    "and summarize themes and common questions. For channel questions, run channel "
+    "analysis and point out which videos performed best and what they have in common. "
+    "For title, tag or video idea requests, run topic research first, then suggest "
+    "original titles (do not copy existing ones), tags and angles based on what works. "
+    "Reply in the same language the user writes in."
+)
+"""YouTube skill: tools an AI agent can use to work with YouTube.
+
+Needs:
+    pip install requests youtube-transcript-api
+    export YOUTUBE_API_KEY="your-youtube-data-api-v3-key"
+"""
+import json
+import os
+import re
+
+import requests
+
+YT_API = "https://www.googleapis.com/youtube/v3"
+YT_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+
+def extract_video_id(url_or_id: str) -> str:
+    """Accepts a full YouTube link (watch, youtu.be, shorts) or a bare ID."""
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})", url_or_id)
+    return m.group(1) if m else url_or_id.strip()
+
+
+def youtube_search(query: str, max_results: int = 5) -> str:
+    r = requests.get(
+        f"{YT_API}/search",
+        params={
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": max_results,
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = [
+        {
+            "video_id": i["id"]["videoId"],
+            "title": i["snippet"]["title"],
+            "channel": i["snippet"]["channelTitle"],
+            "published": i["snippet"]["publishedAt"][:10],
+            "url": f"https://youtu.be/{i['id']['videoId']}",
+        }
+        for i in r.json().get("items", [])
+    ]
+    return json.dumps(items, ensure_ascii=False)
+
+
+def youtube_video_details(video: str) -> str:
+    vid = extract_video_id(video)
+    r = requests.get(
+        f"{YT_API}/videos",
+        params={"part": "snippet,statistics,contentDetails", "id": vid, "key": YT_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    if not items:
+        return "Video not found."
+    v = items[0]
+    return json.dumps(
+        {
+            "title": v["snippet"]["title"],
+            "channel": v["snippet"]["channelTitle"],
+            "description": v["snippet"]["description"][:800],
+            "tags": v["snippet"].get("tags", [])[:15],
+            "duration": v["contentDetails"]["duration"],
+            "views": v["statistics"].get("viewCount"),
+            "likes": v["statistics"].get("likeCount"),
+            "comments": v["statistics"].get("commentCount"),
+        },
+        ensure_ascii=False,
+    )
+
+
+def youtube_transcript(video: str, max_chars: int = 12000) -> str:
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    vid = extract_video_id(video)
+    try:
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(vid, languages=["hi", "en"])
+        text = " ".join(s.text for s in fetched)
+    except Exception as e:  # no captions, private video, blocked, etc.
+        return f"Transcript not available: {e}"
+    return text[:max_chars]
+
+
+def youtube_comments(video: str, max_results: int = 20, order: str = "relevance") -> str:
+    """Top comments of a video. order: 'relevance' or 'time'."""
+    vid = extract_video_id(video)
+    r = requests.get(
+        f"{YT_API}/commentThreads",
+        params={
+            "part": "snippet",
+            "videoId": vid,
+            "maxResults": min(max_results, 50),
+            "order": order,
+            "textFormat": "plainText",
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    if r.status_code == 403:
+        return "Comments are disabled for this video (or quota exceeded)."
+    r.raise_for_status()
+    out = []
+    for i in r.json().get("items", []):
+        c = i["snippet"]["topLevelComment"]["snippet"]
+        out.append(
+            {
+                "author": c["authorDisplayName"],
+                "text": c["textDisplay"][:300],
+                "likes": c["likeCount"],
+                "replies": i["snippet"]["totalReplyCount"],
+            }
+        )
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _resolve_channel_id(channel: str) -> str:
+    """Accepts channel ID, @handle, or channel URL."""
+    channel = channel.strip()
+    m = re.search(r"(UC[A-Za-z0-9_-]{22})", channel)
+    if m:
+        return m.group(1)
+    handle = re.search(r"@([A-Za-z0-9._-]+)", channel)
+    if handle:
+        r = requests.get(
+            f"{YT_API}/channels",
+            params={"part": "id", "forHandle": "@" + handle.group(1), "key": YT_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if items:
+            return items[0]["id"]
+    # fallback: search by name
+    r = requests.get(
+        f"{YT_API}/search",
+        params={"part": "snippet", "q": channel, "type": "channel", "maxResults": 1, "key": YT_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    if not items:
+        raise ValueError("Channel not found")
+    return items[0]["snippet"]["channelId"]
+
+
+def youtube_channel_analysis(channel: str, recent_videos: int = 10) -> str:
+    """Channel stats + performance of its latest videos."""
+    cid = _resolve_channel_id(channel)
+    r = requests.get(
+        f"{YT_API}/channels",
+        params={"part": "snippet,statistics,contentDetails", "id": cid, "key": YT_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    ch = r.json()["items"][0]
+    uploads = ch["contentDetails"]["relatedPlaylists"]["uploads"]
+
+    p = requests.get(
+        f"{YT_API}/playlistItems",
+        params={
+            "part": "contentDetails",
+            "playlistId": uploads,
+            "maxResults": min(recent_videos, 25),
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    p.raise_for_status()
+    ids = [i["contentDetails"]["videoId"] for i in p.json().get("items", [])]
+
+    videos = []
+    if ids:
+        v = requests.get(
+            f"{YT_API}/videos",
+            params={"part": "snippet,statistics", "id": ",".join(ids), "key": YT_KEY},
+            timeout=15,
+        )
+        v.raise_for_status()
+        for i in v.json().get("items", []):
+            videos.append(
+                {
+                    "title": i["snippet"]["title"],
+                    "published": i["snippet"]["publishedAt"][:10],
+                    "views": int(i["statistics"].get("viewCount", 0)),
+                    "likes": int(i["statistics"].get("likeCount", 0)),
+                    "comments": int(i["statistics"].get("commentCount", 0)),
+                    "url": f"https://youtu.be/{i['id']}",
+                }
+            )
+    s = ch["statistics"]
+    return json.dumps(
+        {
+            "channel": ch["snippet"]["title"],
+            "subscribers": s.get("subscriberCount"),
+            "total_views": s.get("viewCount"),
+            "video_count": s.get("videoCount"),
+            "recent_videos": videos,
+        },
+        ensure_ascii=False,
+    )
+
+
+def youtube_topic_research(topic: str, max_results: int = 8) -> str:
+    """Top videos on a topic with views and tags, for title/tag/idea research."""
+    s = requests.get(
+        f"{YT_API}/search",
+        params={
+            "part": "snippet",
+            "q": topic,
+            "type": "video",
+            "order": "viewCount",
+            "maxResults": min(max_results, 15),
+            "key": YT_KEY,
+        },
+        timeout=15,
+    )
+    s.raise_for_status()
+    ids = [i["id"]["videoId"] for i in s.json().get("items", [])]
+    if not ids:
+        return "No videos found."
+    v = requests.get(
+        f"{YT_API}/videos",
+        params={"part": "snippet,statistics", "id": ",".join(ids), "key": YT_KEY},
+        timeout=15,
+    )
+    v.raise_for_status()
+    out = [
+        {
+            "title": i["snippet"]["title"],
+            "channel": i["snippet"]["channelTitle"],
+            "views": i["statistics"].get("viewCount"),
+            "tags": i["snippet"].get("tags", [])[:12],
+            "url": f"https://youtu.be/{i['id']}",
+        }
+        for i in v.json().get("items", [])
+    ]
+    return json.dumps(out, ensure_ascii=False)
+
+
+# name -> function
+TOOL_FUNCS = {
+    "youtube_search": youtube_search,
+    "youtube_video_details": youtube_video_details,
+    "youtube_transcript": youtube_transcript,
+    "youtube_comments": youtube_comments,
+    "youtube_channel_analysis": youtube_channel_analysis,
+    "youtube_topic_research": youtube_topic_research,
+}
+
+# schemas sent to Claude
+TOOLS = [
+    {
+        "name": "youtube_search",
+        "description": "Search YouTube for videos. Returns title, channel, date, link.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "description": "1-10"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "youtube_video_details",
+        "description": "Get stats (views, likes, comments), tags, description of a video from its link or ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"video": {"type": "string", "description": "URL or video ID"}},
+            "required": ["video"],
+        },
+    },
+    {
+        "name": "youtube_transcript",
+        "description": "Get the spoken transcript/captions of a video, to summarize or analyze it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"video": {"type": "string", "description": "URL or video ID"}},
+            "required": ["video"],
+        },
+    },
+    {
+        "name": "youtube_comments",
+        "description": "Read top comments of a video, to understand audience feedback, sentiment and questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "video": {"type": "string", "description": "URL or video ID"},
+                "max_results": {"type": "integer", "description": "1-50"},
+                "order": {"type": "string", "enum": ["relevance", "time"]},
+            },
+            "required": ["video"],
+        },
+    },
+    {
+        "name": "youtube_channel_analysis",
+        "description": "Analyze a channel: subscribers, total views, and performance of its latest videos.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "@handle, channel URL, channel ID or name"},
+                "recent_videos": {"type": "integer", "description": "1-25"},
+            },
+            "required": ["channel"],
+        },
+    },
+    {
+        "name": "youtube_topic_research",
+        "description": "Find the most-viewed videos on a topic with their titles and tags, for title, tag and content idea research.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "max_results": {"type": "integer", "description": "1-15"},
+            },
+            "required": ["topic"],
+        },
+    },
+]
+
+SKILL_PROMPT = (
+    "You have a YouTube skill. Tools: search videos, video details, transcripts, "
+    "comments, channel analysis and topic research. "
+    "For summaries, read the transcript first. For audience feedback, read comments "
+    "and summarize themes and common questions. For channel questions, run channel "
+    "analysis and point out which videos performed best and what they have in common. "
+    "For title, tag or video idea requests, run topic research first, then suggest "
+    "original titles (do not copy existing ones), tags and angles based on what works. "
+    "Reply in the same language the user writes in."
+)
