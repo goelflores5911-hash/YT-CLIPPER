@@ -1,0 +1,7 @@
+name: Clip YouTube Video
+on:
+workflow_dispatch:
+inputs:
+url:
+description: 'YouTube Video URL'
+required: true
